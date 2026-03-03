@@ -1,0 +1,43 @@
+FROM langchain/langgraph-api:0.4.12-py3.11
+
+# Install LibreOffice, curl, gnupg, and build tools (needed for pymupdf on ARM64)
+RUN apt-get update && \
+    apt-get install -y libreoffice curl gnupg lsb-release build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /deps/StoriesExtractor/vectorstore/ppt_references && \
+    mkdir -p /deps/StoriesExtractor/logs && \
+    chmod 755 /deps/StoriesExtractor/vectorstore && \
+    chmod 755 /deps/StoriesExtractor/logs
+
+
+# -- Adding local package . --
+COPY . /deps/StoriesExtractor
+
+# Set the working directory
+WORKDIR /deps/StoriesExtractor
+
+# Set PYTHONPATH to include the package root
+ENV PYTHONPATH="/deps/StoriesExtractor:${PYTHONPATH}"
+
+# -- Installing project without mutating base runtime packages --
+RUN PYTHONDONTWRITEBYTECODE=1 pip install --no-cache-dir --no-deps -e /deps/* && \
+    pip install --no-cache-dir \
+    msal \
+    httpx \
+    requests \
+    openai \
+    pydantic_settings \
+    python-dotenv \
+    pandas \
+    minio \
+    pymupdf \
+    python-pptx \
+    Pillow \
+    reportlab \
+    weaviate-client \
+    langgraph-runtime-inmem==0.10.0
+
+# -- End of local dependencies install --
+
+ENV LANGSERVE_GRAPHS='{"email-ingestion-agent": "/deps/StoriesExtractor/src/agent/email_ingestion_graph.py:email_ingestion_graph", "email-classification-agent": "/deps/StoriesExtractor/src/agent/email_classification_graph.py:email_classification_graph"}'

@@ -1,0 +1,8 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+      "email-ingestion-agent": "./src/agent/email_ingestion_graph.py:email_ingestion_graph",
+      "email-classification-agent": "./src/agent/email_classification_graph.py:email_classification_graph"
+    },
+    "env": ".env"
+  }   

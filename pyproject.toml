@@ -1,0 +1,61 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "src"
+version = "0.1.1"
+description = ""
+authors = ["Maroun Saade <maroun.saade@reailize.com>"]
+package-mode = true
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+
+msal = "^1.34.0"
+httpx = "^0.28.0"
+requests = "^2.32.3"
+openai = "^1.68.2"
+
+pydantic_settings = "^2.10.1"
+python-dotenv = "^1.0.1"
+
+pandas = "^2.3.0"
+
+# Object storage
+minio = "^7.2.8"
+
+
+pymupdf = "^1.24.0"          
+python-pptx = "^1.0.2"    
+Pillow = "^10.0.0"  
+reportlab = "^4.4.4"       # Simple PDF generation  
+
+
+weaviate-client = "^4.11.3"
+
+# Windows-only helper (ignored on Linux containers)
+pywin32 = { version = "^306", markers = "platform_system == 'Windows'" }
+
+[[tool.poetry.source]]
+name = "pypi"
+priority = "primary"
+
+# --- Lint/format settings ---
+[tool.ruff]
+lint.select = ["F", "E", "W", "I001"]
+line-length = 120
+target-version = "py39"
+src = ["src", "tests"]
+fix = true
+
+[tool.ruff.lint.isort]
+force-single-line = true
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+known-local-folder = ["src"]
+
+[tool.ruff.format]
+indent-style = "space"
+skip-magic-trailing-comma = true
+line-ending = "auto"
