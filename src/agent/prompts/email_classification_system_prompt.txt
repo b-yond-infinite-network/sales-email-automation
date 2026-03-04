@@ -103,6 +103,7 @@ Do not summarize.
 	9.	email
 Extract the email of the person who filled the form.
 DO NOT use the confirmation sender email.
+If the email is not a coorporate email (e.g. @gmail.com, @outlook.com) disqualify AUTOMATICALLY.
 	10.	contact_name
 Extract first name from form.
 	11.	contact_last_name

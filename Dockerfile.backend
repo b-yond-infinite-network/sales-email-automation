@@ -1,24 +1,5 @@
-# Use Node.js image for building UI, then switch to Python
-FROM node:18-alpine AS ui-builder
-
-# Set working directory for UI build
-WORKDIR /ui
-
-# Copy UI package files
-COPY src/ui/package.json src/ui/package-lock.json ./
-
-# Install UI dependencies
-RUN npm install
-
-# Copy UI source code
-COPY src/ui/ ./
-
-# Build the UI (using npm run build since dist command has path issues)
-RUN npm run build
-
 # Use Python 3.11 to match the project requirements
-FROM python:3.11-slim
-
+FROM python:3.13-slim
 
 # Set working directory
 WORKDIR /app
@@ -26,9 +7,6 @@ WORKDIR /app
 # Copy the entire src directory to maintain proper structure
 COPY src/ ./src/
 COPY .env* ./
-
-# Copy the built UI from the ui-builder stage to agent templates
-COPY --from=ui-builder /ui/dist ./src/agent/templates/dist
 
 # Install dependencies
 RUN pip install fastapi uvicorn httpx jinja2 python-dotenv minio python-multipart requests pydantic-settings msal pyjwt passlib[bcrypt] email-validator psycopg2-binary

@@ -6,12 +6,15 @@ from datetime import datetime, timedelta, timezone
 from msal import ConfidentialClientApplication
 from src.agent.logger import get_logger
 from src.agent.config import Config
+from src.agent.excel_tracker import EmailClassificationExcelTracker
 
 logging = get_logger(__name__)
 config = Config()
 
-HTTP_TIMEOUT = httpx.Timeout(30.0)
-GRAPH_RUN_WAIT_TIMEOUT = httpx.Timeout(180.0)
+# HTTP timeout constants - these ensure requests don't hang indefinitely
+HTTP_TIMEOUT = httpx.Timeout(30.0, read=30.0)
+# Graph run timeout with explicit read timeout to catch hanging connections
+GRAPH_RUN_WAIT_TIMEOUT = 120.0  # 2 minutes - allow time for LLM processing
 
 # State management
 processed_email_ids: Set[str] = set()
@@ -23,6 +26,7 @@ class EmailPoller:
     def __init__(self):
         self.session: Optional[httpx.AsyncClient] = None
         self.running = False
+        self.excel_tracker = EmailClassificationExcelTracker()
         
     async def get_access_token(self) -> Optional[str]:
         """Acquire an access token using MSAL for Microsoft Graph API."""
@@ -104,6 +108,26 @@ class EmailPoller:
             logging.error(f"Error fetching inbox messages: {str(e)}")
             return []
 
+    async def mark_email_as_read(self, message_id: str, access_token: str) -> bool:
+        """Mark an email as read in Microsoft Graph."""
+        try:
+            url = f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/messages/{message_id}"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            payload = {"isRead": True}
+            
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                response = await client.patch(url, headers=headers, json=payload)
+                response.raise_for_status()
+                
+            logging.debug(f"Successfully marked email {message_id} as read")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error marking email {message_id} as read: {str(e)}")
+            return False
 
     async def process_email_via_graph(self, message_id: str) -> bool:
         """Process an email using ingestion and classification graphs."""
@@ -116,17 +140,32 @@ class EmailPoller:
             conversation_id = f"email_{message_id}"
             
             # Create thread for this email
-            thread_response = await session.post(
-                f"{config.GRAPH_API_BASE_URL}/threads",
-                json={},
-                headers={"Content-Type": "application/json"},
-            )
+            try:
+                thread_response = await asyncio.wait_for(
+                    session.post(
+                        f"{config.GRAPH_API_BASE_URL}/threads",
+                        json={},
+                        headers={"Content-Type": "application/json"},
+                    ),
+                    timeout=10.0  # Quick timeout for thread creation
+                )
+            except asyncio.TimeoutError:
+                logging.error(f"Timeout creating thread for email {message_id}")
+                return False
+            except Exception as e:
+                logging.error(f"Failed to create thread for email {message_id}: {e}")
+                return False
             
             if thread_response.status_code != 200:
                 logging.error(f"Failed to create thread for email {message_id}: {thread_response.text}")
                 return False
             
-            thread_data = thread_response.json()
+            try:
+                thread_data = thread_response.json()
+            except Exception as e:
+                logging.error(f"Invalid thread response for email {message_id}: {e}")
+                return False
+                
             thread_id = thread_data.get("thread_id")
             
             if not thread_id:
@@ -148,7 +187,7 @@ class EmailPoller:
             )
 
             if ingestion_result is None:
-                logging.error(f"Email ingestion failed for message ID: {message_id}")
+                logging.error(f"Email ingestion failed or timed out for message ID: {message_id}")
                 return False
 
             email_content = ingestion_result.get("email_content", "")
@@ -174,7 +213,7 @@ class EmailPoller:
             )
 
             if classification_result is None:
-                logging.error(f"Email classification failed for message ID: {message_id}")
+                logging.error(f"Email classification failed or timed out for message ID: {message_id}")
                 return False
 
             classification = classification_result.get("classification", {})
@@ -186,7 +225,30 @@ class EmailPoller:
                 classification.get("salesperson"),
                 classification.get("confidence"),
             )
-
+            
+            # Append to Excel file with error handling
+            created_at = datetime.now(timezone.utc).isoformat()
+            status = classification_result.get("status", "success")
+            try:
+                excel_success = self.excel_tracker.append_email(
+                    thread_id=thread_id,
+                    created_at=created_at,
+                    email_id=message_id,
+                    sender=sender_email,
+                    email_content=email_content,
+                    classification=classification,
+                    status=status,
+                )
+            except Exception as e:
+                logging.error(f"Failed to append email to Excel tracker: {e}")
+                excel_success = False
+            
+            if not excel_success:
+                logging.warning(f"Failed to write classification results to Excel for {message_id}")
+                # Don't fail the whole operation if Excel tracking fails
+                return True
+            
+            logging.info(f"Email {message_id} successfully processed and added to tracking")
             return True
                 
         except Exception as e:
@@ -208,18 +270,57 @@ class EmailPoller:
         }
 
         try:
-            response = await session.post(
-                endpoint_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=GRAPH_RUN_WAIT_TIMEOUT,
+            # Use asyncio.wait_for to enforce strict timeout
+            response = await asyncio.wait_for(
+                session.post(
+                    endpoint_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=GRAPH_RUN_WAIT_TIMEOUT,
+                ),
+                timeout=GRAPH_RUN_WAIT_TIMEOUT + 5  # Add 5s buffer for cleanup
             )
-        except httpx.ReadTimeout:
+        except asyncio.TimeoutError:
             logging.error(
-                "Graph run timed out after %.0fs (assistant=%s, thread_id=%s)",
-                GRAPH_RUN_WAIT_TIMEOUT.read,
+                "Graph run timed out after %.0fs (assistant=%s, thread_id=%s). "
+                "The LangGraph API may be overloaded or the email is taking too long to process.",
+                GRAPH_RUN_WAIT_TIMEOUT,
                 assistant_id,
                 thread_id,
+            )
+            return None
+        except httpx.ReadTimeout:
+            logging.error(
+                "Graph run read timeout after %.0fs (assistant=%s, thread_id=%s). "
+                "Possible connection issue with LangGraph API.",
+                GRAPH_RUN_WAIT_TIMEOUT,
+                assistant_id,
+                thread_id,
+            )
+            return None
+        except httpx.ConnectError as e:
+            logging.error(
+                "Failed to connect to LangGraph API (assistant=%s, thread_id=%s): %s. "
+                "Check if the API server is running and accessible.",
+                assistant_id,
+                thread_id,
+                str(e),
+            )
+            return None
+        except httpx.RequestError as e:
+            logging.error(
+                "Graph request failed (assistant=%s, thread_id=%s): %s",
+                assistant_id,
+                thread_id,
+                str(e),
+            )
+            return None
+        except Exception as e:
+            logging.error(
+                "Unexpected error during graph run (assistant=%s, thread_id=%s): %s",
+                assistant_id,
+                thread_id,
+                str(e),
             )
             return None
 
@@ -228,14 +329,18 @@ class EmailPoller:
                 "Graph run failed (assistant=%s, status=%s): %s",
                 assistant_id,
                 response.status_code,
-                response.text,
+                response.text[:500],  # Limit error message length
             )
             return None
 
         try:
             return response.json()
-        except Exception:
-            logging.error("Graph run returned non-JSON response for assistant=%s", assistant_id)
+        except Exception as e:
+            logging.error(
+                "Graph run returned non-JSON response (assistant=%s): %s",
+                assistant_id,
+                str(e),
+            )
             return None
 
     def _parse_ingested_email_content(self, email_content: str) -> Tuple[str, str, str]:
@@ -309,9 +414,15 @@ class EmailPoller:
                         success = await self.process_email_via_graph(message_id)
                         
                         if success:
-                            # Mark as processed and read
-                            processed_email_ids.add(message_id)
-                            logging.info(f"Successfully processed and marked email {message_id} as read")
+                            # Mark as read in Microsoft Graph
+                            marked_read = await self.mark_email_as_read(message_id, access_token)
+                            
+                            if marked_read:
+                                # Add to processed set only after successfully marking as read
+                                processed_email_ids.add(message_id)
+                                logging.info(f"Successfully processed and marked email {message_id} as read")
+                            else:
+                                logging.warning(f"Email {message_id} processed but failed to mark as read - will retry next cycle")
                         else:
                             logging.error(f"Failed to process email {message_id}")
                         
@@ -380,7 +491,8 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     # Wait 5 minutes before starting to ensure all services are ready
-    startup_delay = 300
+    # TODO: change this back to 5 minutes in production, currently set to 5 seconds for testing
+    startup_delay = 5
     logging.info(f"Email Poller starting in {startup_delay} seconds...")
     
     try:

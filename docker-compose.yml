@@ -165,6 +165,7 @@ services:
 
         volumes:
             - ./logs:/app/logs
+            - .:/app/output
         restart: unless-stopped
         healthcheck:
             test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]

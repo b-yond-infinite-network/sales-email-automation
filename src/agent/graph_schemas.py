@@ -221,11 +221,11 @@ class EmailClassificationRequest(BaseModel):
 
 
 class CompanyVerificationResult(BaseModel):
-    is_corporate_email: bool = Field(description="Whether sender email appears to be a corporate domain")
+    is_corporate_email: bool = Field(description="Whether form email appears to be a corporate domain (not a personal email provider)")
     is_legit_company: bool = Field(description="Whether company appears to be a legitimate organization")
     company_type: str = Field(description="Company category such as telecom, finance, healthcare, etc")
     company_name: Optional[str] = Field(default=None, description="Detected or inferred company name")
-    sender_domain: str = Field(description="Normalized sender email domain")
+    sender_domain: str = Field(description="Domain of the email from the form submission (extracted from email body, not the sender)")
     reason: str = Field(description="Short rationale for the verification result")
 
 

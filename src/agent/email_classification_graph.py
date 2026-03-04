@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 import re
 from typing import List
 from urllib.parse import quote
@@ -16,6 +17,11 @@ from src.agent.graph_schemas import (
     EmailClassificationState,
 )
 from src.agent.logger import get_logger
+
+# Timeout constants
+WEB_SEARCH_TIMEOUT = 10.0  # seconds
+LLM_TIMEOUT = 60.0  # seconds
+HTTP_TIMEOUT = httpx.Timeout(10.0)
 
 logger = get_logger(__name__)
 config = Config()
@@ -79,15 +85,17 @@ async def _fetch_public_company_context(company_name: str) -> str:
         return ""
 
     snippets: List[str] = []
-    timeout = httpx.Timeout(10.0)
 
     try:
         ddg_url = (
             "https://api.duckduckgo.com/?q="
             f"{quote(company_name)}&format=json&no_html=1&skip_disambig=1"
         )
-        async with httpx.AsyncClient(timeout=timeout) as async_client:
-            ddg_resp = await async_client.get(ddg_url)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+            ddg_resp = await asyncio.wait_for(
+                async_client.get(ddg_url),
+                timeout=WEB_SEARCH_TIMEOUT
+            )
             if ddg_resp.status_code == 200:
                 data = ddg_resp.json() or {}
                 abstract_text = str(data.get("AbstractText") or "").strip()
@@ -100,20 +108,27 @@ async def _fetch_public_company_context(company_name: str) -> str:
                     first_text = str(first_topic.get("Text") or "").strip() if isinstance(first_topic, dict) else ""
                     if first_text:
                         snippets.append(f"DuckDuckGo related: {first_text[:1000]}")
+    except asyncio.TimeoutError:
+        logger.warning(f"DuckDuckGo context fetch timed out after {WEB_SEARCH_TIMEOUT}s")
     except Exception as exc:
-        logger.warning(f"DuckDuckGo context fetch failed: {exc}")
+        logger.warning(f"DuckDuckGo context fetch failed: {type(exc).__name__}: {exc}")
 
     try:
         wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(company_name)}"
-        async with httpx.AsyncClient(timeout=timeout) as async_client:
-            wiki_resp = await async_client.get(wiki_url)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+            wiki_resp = await asyncio.wait_for(
+                async_client.get(wiki_url),
+                timeout=WEB_SEARCH_TIMEOUT
+            )
             if wiki_resp.status_code == 200:
                 wiki = wiki_resp.json() or {}
                 extract = str(wiki.get("extract") or "").strip()
                 if extract:
                     snippets.append(f"Wikipedia: {extract[:1200]}")
+    except asyncio.TimeoutError:
+        logger.warning(f"Wikipedia context fetch timed out after {WEB_SEARCH_TIMEOUT}s")
     except Exception as exc:
-        logger.warning(f"Wikipedia context fetch failed: {exc}")
+        logger.warning(f"Wikipedia context fetch failed: {type(exc).__name__}: {exc}")
 
     return "\n\n".join(snippets)
 
@@ -219,39 +234,9 @@ async def retrieve_context(state: EmailClassificationState):
 
 
 async def classify_email(state: EmailClassificationState):
-    system_prompt = _get_system_prompt()
-    user_prompt_template = _get_user_prompt_template()
-
-    user_prompt = user_prompt_template.format(
-        email_subject=state.email_subject or "",
-        email_body=state.email_body or "",
-        attachment_text=state.attachment_text or "",
-        retrieved_context=state.retrieved_context or "",
-    )
-
-    try:
-        response = await client.beta.chat.completions.parse(
-            model=config.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format=EmailClassificationResult,
-        )
-
-        parsed = response.choices[0].message.parsed
-        if not parsed:
-            raise ValueError("No parsed response returned by model")
-
-        result = parsed.model_dump()
-        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
-
-        return {
-            "classification": result,
-            "status": "email classified successfully",
-        }
-    except Exception as exc:
-        logger.error(f"Email classification failed: {exc}")
+    # Validate required configuration
+    if not config.OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY not configured - cannot classify email")
         fallback = EmailClassificationResult(
             date_of_contact="",
             action="disqualify",
@@ -268,10 +253,91 @@ async def classify_email(state: EmailClassificationState):
             confidence=0.0,
         )
         fallback_payload = fallback.model_dump()
-        fallback_payload["error"] = f"classification_failed: {exc}"
+        fallback_payload["error"] = "classification_skipped: missing API key"
         return {
             "classification": fallback_payload,
-            "status": "email classification failed; fallback returned",
+            "status": "email classification skipped: API key not configured",
+        }
+
+    system_prompt = _get_system_prompt()
+    user_prompt_template = _get_user_prompt_template()
+
+    user_prompt = user_prompt_template.format(
+        email_subject=state.email_subject or "",
+        email_body=state.email_body or "",
+        attachment_text=state.attachment_text or "",
+        retrieved_context=state.retrieved_context or "",
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            client.beta.chat.completions.parse(
+                model=config.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format=EmailClassificationResult,
+            ),
+            timeout=LLM_TIMEOUT
+        )
+
+        parsed = response.choices[0].message.parsed
+        if not parsed:
+            raise ValueError("No parsed response returned by model")
+
+        result = parsed.model_dump()
+        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+
+        return {
+            "classification": result,
+            "status": "email classified successfully",
+        }
+    except asyncio.TimeoutError:
+        logger.error(f"Email classification timeout after {LLM_TIMEOUT}s")
+        fallback = EmailClassificationResult(
+            date_of_contact="",
+            action="disqualify",
+            company_name="",
+            company_type="unknown",
+            operation_countries=[],
+            company_presence=[],
+            current_projects=[],
+            source="",
+            email="",
+            contact_name="",
+            contact_last_name="",
+            salesperson="none",
+            confidence=0.0,
+        )
+        fallback_payload = fallback.model_dump()
+        fallback_payload["error"] = "classification_failed: timeout"
+        return {
+            "classification": fallback_payload,
+            "status": f"email classification timed out after {LLM_TIMEOUT}s; fallback returned",
+        }
+    except Exception as exc:
+        logger.error(f"Email classification failed: {type(exc).__name__}: {exc}", exc_info=True)
+        fallback = EmailClassificationResult(
+            date_of_contact="",
+            action="disqualify",
+            company_name="",
+            company_type="unknown",
+            operation_countries=[],
+            company_presence=[],
+            current_projects=[],
+            source="",
+            email="",
+            contact_name="",
+            contact_last_name="",
+            salesperson="none",
+            confidence=0.0,
+        )
+        fallback_payload = fallback.model_dump()
+        fallback_payload["error"] = f"classification_failed: {type(exc).__name__}"
+        return {
+            "classification": fallback_payload,
+            "status": f"email classification failed ({type(exc).__name__}); fallback returned",
         }
 
 

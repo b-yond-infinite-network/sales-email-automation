@@ -1,4 +1,4 @@
-FROM langchain/langgraph-api:0.4.12-py3.11
+FROM langchain/langgraph-api:0.7.60-py3.13
 
 # Install LibreOffice, curl, gnupg, and build tools (needed for pymupdf on ARM64)
 RUN apt-get update && \
@@ -30,13 +30,14 @@ RUN PYTHONDONTWRITEBYTECODE=1 pip install --no-cache-dir --no-deps -e /deps/* &&
     pydantic_settings \
     python-dotenv \
     pandas \
+    openpyxl \
     minio \
     pymupdf \
     python-pptx \
     Pillow \
     reportlab \
-    weaviate-client \
-    langgraph-runtime-inmem==0.10.0
+    weaviate-client && \
+    pip install --no-cache-dir "langgraph-runtime-inmem>=0.26.0,<0.27.0"
 
 # -- End of local dependencies install --
 

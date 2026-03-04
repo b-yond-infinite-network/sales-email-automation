@@ -107,7 +107,8 @@ class Config(BaseSettings):
     PUBLIC_NOTIFICATION_URL: str = Field(default="https://141.148.30.59/notifications")
     
     # Email polling configuration
-    POLLING_INTERVAL_SECONDS: int = Field(default=3600)  # 1 hour
+    # TODO: change back to 3600 seconds (1 hour) in production, currently set to 30 seconds for testing
+    POLLING_INTERVAL_SECONDS: int = Field(default=30)  # 1 hour
     MAX_EMAILS_PER_POLL: int = Field(default=50)  # Limit to prevent overwhelming the system
 
     # Graph API Configuration

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -14,6 +15,12 @@ from langgraph.graph import END, START, StateGraph
 from src.agent.config import Config
 from src.agent.graph_schemas import EmailClassificationResult, EmailIngestionOutput, EmailIngestionRequest, EmailIngestionState
 from src.agent.logger import get_logger
+from src.agent.excel_tracker import EmailClassificationExcelTracker
+
+# Timeout constants for API calls
+HTTP_TIMEOUT = httpx.Timeout(30.0)
+LLM_TIMEOUT = 60.0  # seconds
+TOKEN_REQUEST_TIMEOUT = 30.0  # seconds
 
 logger = get_logger(__name__)
 config = Config()
@@ -97,7 +104,8 @@ async def get_access_token() -> Optional[str]:
         ]
         if missing_fields:
             logger.error(
-                "Auth config missing required fields: %s. Check .env loading and runtime working directory.",
+                "Auth config missing required fields: %s. Check .env loading and runtime working directory. "
+                "Make sure your .env file contains CLIENT_ID, CLIENT_SECRET, and TENANT_ID.",
                 ", ".join(missing_fields),
             )
             return None
@@ -113,18 +121,28 @@ async def get_access_token() -> Optional[str]:
         }
 
         async def _request_token_via_httpx() -> dict:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as async_client:
-                response = await async_client.post(token_url, data=payload)
+            try:
+                async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+                    response = await asyncio.wait_for(
+                        async_client.post(token_url, data=payload),
+                        timeout=TOKEN_REQUEST_TIMEOUT
+                    )
 
-            if response.status_code != 200:
-                logger.error(
-                    "Failed to get access token. Status: %s, Body: %s",
-                    response.status_code,
-                    response.text[:800],
-                )
+                if response.status_code != 200:
+                    logger.error(
+                        "Failed to get access token. Status: %s, Body: %s",
+                        response.status_code,
+                        response.text[:800],
+                    )
+                    return {}
+
+                return response.json()
+            except asyncio.TimeoutError:
+                logger.error("Token request timed out after %s seconds", TOKEN_REQUEST_TIMEOUT)
                 return {}
-
-            return response.json()
+            except Exception as e:
+                logger.error(f"HTTPX token request error: {e}")
+                return {}
 
         async def _request_token_via_curl() -> dict:
             proc = await asyncio.create_subprocess_exec(
@@ -185,6 +203,10 @@ async def get_email_messages(state: EmailIngestionState):
     if not access_token:
         return {"status": "failed: no access token", "email_content": ""}
 
+    if not config.MAIL_USER:
+        logger.error("MAIL_USER not configured in environment variables")
+        return {"status": "failed: MAIL_USER not configured", "email_content": ""}
+
     url = (
         f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/messages/{state.email_id}"
         "?$select=id,conversationId,hasAttachments,subject,isRead,body,webLink,sender,from"
@@ -196,8 +218,11 @@ async def get_email_messages(state: EmailIngestionState):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as async_client:
-            response = await async_client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+            response = await asyncio.wait_for(
+                async_client.get(url, headers=headers),
+                timeout=30.0
+            )
 
         if response.status_code != 200:
             logger.error(f"Failed to fetch email message: {response.status_code} {response.text}")
@@ -219,9 +244,15 @@ async def get_email_messages(state: EmailIngestionState):
             "hasAttachments": has_attachments,
             "sender": sender_email,
         }
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout fetching email message {state.email_id} - request exceeded 30 seconds")
+        return {"status": "failed: email fetch timeout", "email_content": ""}
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse email response JSON: {exc}")
+        return {"status": "failed: invalid email response format", "email_content": ""}
     except Exception as exc:
-        logger.error(f"Unexpected error while fetching email message: {exc}")
-        return {"status": "failed: exception while fetching email", "email_content": ""}
+        logger.error(f"Unexpected error while fetching email message: {exc}", exc_info=True)
+        return {"status": f"failed: exception while fetching email - {type(exc).__name__}", "email_content": ""}
 
 
 async def download_attachments(state: EmailIngestionState):
@@ -232,6 +263,10 @@ async def download_attachments(state: EmailIngestionState):
     if not access_token:
         return {"status": "failed: no access token for attachments", "attachment_files": []}
 
+    if not config.MAIL_USER:
+        logger.error("MAIL_USER not configured for attachment download")
+        return {"status": "failed: MAIL_USER not configured", "attachment_files": []}
+
     url = f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/messages/{state.email_id}/attachments"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -239,17 +274,26 @@ async def download_attachments(state: EmailIngestionState):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as async_client:
-            response = await async_client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+            response = await asyncio.wait_for(
+                async_client.get(url, headers=headers),
+                timeout=45.0
+            )
 
         if response.status_code != 200:
             logger.error(f"Failed to fetch attachments: {response.status_code} {response.text}")
             return {"status": "failed: attachment fetch failed", "attachment_files": []}
 
         data = response.json()
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout downloading attachments for email {state.email_id} - request exceeded 45 seconds")
+        return {"status": "failed: attachment download timeout", "attachment_files": []}
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse attachments response JSON: {exc}")
+        return {"status": "failed: invalid attachments response format", "attachment_files": []}
     except Exception as exc:
-        logger.error(f"Unexpected error while fetching attachments: {exc}")
-        return {"status": "failed: exception while fetching attachments", "attachment_files": []}
+        logger.error(f"Unexpected error while fetching attachments: {exc}", exc_info=True)
+        return {"status": f"failed: exception while fetching attachments - {type(exc).__name__}", "attachment_files": []}
 
     files: List[Tuple[str, str]] = []
     for attachment in data.get("value", []):
@@ -333,7 +377,8 @@ async def extract_attachment_text(state: EmailIngestionState):
     for filename, content_b64 in state.attachment_files:
         try:
             raw = base64.b64decode(content_b64)
-            text = _extract_text_by_filename(filename, raw)
+            # Run blocking file parsing operations in a thread pool
+            text = await asyncio.to_thread(_extract_text_by_filename, filename, raw)
             if text:
                 extracted_blocks.append(f"Attachment: {filename}\n{text[:4000]}")
                 extracted_count += 1
@@ -384,40 +429,8 @@ async def classify_email(state: EmailIngestionState):
             "status": "classification skipped: no email content",
         }
 
-    email_subject, email_body, attachment_text = _parse_ingested_email_content(state.email_content)
-    system_prompt = _get_system_prompt()
-    user_prompt_template = _get_user_prompt_template()
-
-    user_prompt = user_prompt_template.format(
-        email_subject=email_subject or "",
-        email_body=email_body or "",
-        attachment_text=attachment_text or "",
-        retrieved_context="",
-    )
-
-    try:
-        response = await client.beta.chat.completions.parse(
-            model=config.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format=EmailClassificationResult,
-        )
-
-        parsed = response.choices[0].message.parsed
-        if not parsed:
-            raise ValueError("No parsed response returned by model")
-
-        result = parsed.model_dump()
-        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
-
-        return {
-            "classification": result,
-            "status": "email classified successfully",
-        }
-    except Exception as exc:
-        logger.error(f"Email classification failed in ingestion graph: {exc}")
+    if not config.OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY not configured - cannot classify email")
         fallback = EmailClassificationResult(
             date_of_contact="",
             action="disqualify",
@@ -434,10 +447,166 @@ async def classify_email(state: EmailIngestionState):
             confidence=0.0,
         )
         fallback_payload = fallback.model_dump()
-        fallback_payload["error"] = f"classification_failed: {exc}"
+        fallback_payload["error"] = "classification_skipped: missing API key"
         return {
             "classification": fallback_payload,
-            "status": "email classification failed; fallback returned",
+            "status": "classification skipped: API key not configured",
+        }
+
+    email_subject, email_body, attachment_text = _parse_ingested_email_content(state.email_content)
+    system_prompt = _get_system_prompt()
+    user_prompt_template = _get_user_prompt_template()
+
+    user_prompt = user_prompt_template.format(
+        email_subject=email_subject or "",
+        email_body=email_body or "",
+        attachment_text=attachment_text or "",
+        retrieved_context="",
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            client.beta.chat.completions.parse(
+                model=config.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format=EmailClassificationResult,
+            ),
+            timeout=LLM_TIMEOUT
+        )
+
+        parsed = response.choices[0].message.parsed
+        if not parsed:
+            raise ValueError("No parsed response returned by model")
+
+        result = parsed.model_dump()
+        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+
+        return {
+            "classification": result,
+            "status": "email classified successfully",
+        }
+    except asyncio.TimeoutError:
+        logger.error(f"Email classification timeout after {LLM_TIMEOUT}s for email {state.email_id}")
+        fallback = EmailClassificationResult(
+            date_of_contact="",
+            action="disqualify",
+            company_name="",
+            company_type="unknown",
+            operation_countries=[],
+            company_presence=[],
+            current_projects=[],
+            source="",
+            email="",
+            contact_name="",
+            contact_last_name="",
+            salesperson="none",
+            confidence=0.0,
+        )
+        fallback_payload = fallback.model_dump()
+        fallback_payload["error"] = "classification_failed: timeout"
+        return {
+            "classification": fallback_payload,
+            "status": f"email classification timed out after {LLM_TIMEOUT}s; fallback returned",
+        }
+    except Exception as exc:
+        logger.error(f"Email classification failed in ingestion graph: {type(exc).__name__}: {exc}", exc_info=True)
+        fallback = EmailClassificationResult(
+            date_of_contact="",
+            action="disqualify",
+            company_name="",
+            company_type="unknown",
+            operation_countries=[],
+            company_presence=[],
+            current_projects=[],
+            source="",
+            email="",
+            contact_name="",
+            contact_last_name="",
+            salesperson="none",
+            confidence=0.0,
+        )
+        fallback_payload = fallback.model_dump()
+        fallback_payload["error"] = f"classification_failed: {type(exc).__name__}"
+        return {
+            "classification": fallback_payload,
+            "status": f"email classification failed ({type(exc).__name__}); fallback returned",
+        }
+
+
+def _append_to_excel_sync(
+    thread_id: str,
+    created_at: str,
+    email_id: str,
+    sender: str,
+    email_content: str,
+    classification: dict,
+    status: str,
+) -> tuple[bool, str]:
+    """Synchronous function to handle all Excel operations in a thread."""
+    try:
+        tracker = EmailClassificationExcelTracker()
+        success = tracker.append_email(
+            thread_id=thread_id,
+            created_at=created_at,
+            email_id=email_id,
+            sender=sender,
+            email_content=email_content,
+            classification=classification,
+            status=status,
+        )
+        return success, str(tracker.excel_file)
+    except Exception as exc:
+        logger.error(f"Excel append error: {exc}", exc_info=True)
+        return False, str(exc)
+
+
+async def append_to_excel(state: EmailIngestionState):
+    """Append classified email to Excel file (optional step that doesn't fail the workflow)."""
+    try:
+        # Get thread_id from conversation_id or generate one
+        thread_id = state.conversation_id or "unknown"
+        
+        # Get current timestamp if not available
+        created_at = datetime.now().isoformat()
+        
+        # Run ALL synchronous Excel operations (including initialization) in a thread pool
+        # This prevents blocking the event loop with file I/O and directory creation
+        success, excel_path = await asyncio.wait_for(
+            asyncio.to_thread(
+                _append_to_excel_sync,
+                thread_id=thread_id,
+                created_at=created_at,
+                email_id=state.email_id or "",
+                sender=state.sender or "",
+                email_content=state.email_content or "",
+                classification=state.classification or {},
+                status="processed",
+            ),
+            timeout=30.0  # 30 second timeout for Excel operations
+        )
+        
+        if success:
+            logger.info(f"Successfully appended email to Excel: {excel_path}")
+            return {
+                "status": f"email appended to Excel: {excel_path}",
+            }
+        else:
+            logger.warning(f"Excel append returned False: {excel_path}")
+            return {
+                "status": "excel append completed with warnings",
+            }
+    except asyncio.TimeoutError:
+        logger.error("Excel append operation timed out after 30s")
+        return {
+            "status": "excel append timed out (non-fatal)",
+        }
+    except Exception as exc:
+        logger.error(f"Failed to append to Excel: {exc}", exc_info=True)
+        return {
+            "status": f"excel append failed: {type(exc).__name__} (non-fatal)",
         }
 
 
@@ -451,11 +620,13 @@ email_ingestion_graph_builder.add_node("get_email_messages", get_email_messages)
 email_ingestion_graph_builder.add_node("download_attachments", download_attachments)
 email_ingestion_graph_builder.add_node("extract_attachment_text", extract_attachment_text)
 email_ingestion_graph_builder.add_node("classify_email", classify_email)
+email_ingestion_graph_builder.add_node("append_to_excel", append_to_excel)
 
 email_ingestion_graph_builder.add_edge(START, "get_email_messages")
 email_ingestion_graph_builder.add_edge("get_email_messages", "download_attachments")
 email_ingestion_graph_builder.add_edge("download_attachments", "extract_attachment_text")
 email_ingestion_graph_builder.add_edge("extract_attachment_text", "classify_email")
-email_ingestion_graph_builder.add_edge("classify_email", END)
+email_ingestion_graph_builder.add_edge("classify_email", "append_to_excel")
+email_ingestion_graph_builder.add_edge("append_to_excel", END)
 
 email_ingestion_graph = email_ingestion_graph_builder.compile()
