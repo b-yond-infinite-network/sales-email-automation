@@ -1,12 +1,7 @@
 volumes:
     langgraph-data:
         driver: local
-    weaviate-data:
-        driver: local
     postgres-data:
-    model-cache:
-    minio-data:
-        driver: local
 services:
     langgraph-redis:
         image: redis:6
@@ -32,72 +27,6 @@ services:
             timeout: 1s
             retries: 5
             interval: 5s
-    minio:
-        image: minio/minio:latest
-        ports:
-            - "9000:9000"
-            - "9001:9001"
-        volumes:
-            - minio-data:/data
-        environment:
-            MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-            MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
-            MINIO_ADDRESS: ":9000"
-            MINIO_CONSOLE_ADDRESS: ":9001"
-        command: server /data --console-address ":9001"
-        healthcheck:
-            test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-            interval: 30s
-            timeout: 20s
-            retries: 3
-    weaviate:
-        container_name: weaviate
-        command:
-            - --host
-            - 0.0.0.0
-            - --port
-            - '8080'
-            - --scheme
-            - http
-        image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
-        ports:
-            - 8080:8080
-            - 50051:50051
-        volumes:
-            - ./weaviate-data:/var/lib/weaviate
-        restart: on-failure:0
-        environment:
-            DISABLE_TELEMETRY: 'true'
-            QUERY_DEFAULTS_LIMIT: 25
-            AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'false'
-            AUTHENTICATION_APIKEY_ENABLED: 'true'
-            AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEYS}
-            AUTHENTICATION_APIKEY_USERS: 'weaviate'
-            PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-            BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backups'
-            ENABLE_MODULES: 'text2vec-openai'
-            DEFAULT_VECTORIZER_MODULE: 'text2vec-openai'
-            CLUSTER_HOSTNAME: 'node1'
-        env_file:
-            - ./.env
-        healthcheck:
-            test: wget --no-verbose --tries=3 --spider http://localhost:8080/v1/.well-known/ready || exit 1
-            interval: 5s
-            timeout: 10s
-            retries: 5
-            start_period: 10s
-
-    # weaviate-ui:
-    #     image: naaive/weaviate-ui:latest
-    #     ports:
-    #         - "7777:7777"
-    #     environment:
-    #         WEAVIATE_URL: http://weaviate:8080
-    #         WEAVIATE_API_KEYS: my-api-key
-    #     depends_on:
-    #         weaviate:
-    #             condition: service_healthy
-
     langgraph-api:
         build:
             context: .
@@ -109,8 +38,6 @@ services:
                 condition: service_healthy
             langgraph-postgres:
                 condition: service_healthy
-            minio:
-                condition: service_healthy
         env_file:
             - .env
         environment:
@@ -118,36 +45,10 @@ services:
             POSTGRES_URI: postgres://postgres:postgres@langgraph-postgres:5432/postgres?sslmode=disable
             DATABASE_URI: postgres://postgres:postgres@langgraph-postgres:5432/postgres?sslmode=disable
             LANGGRAPH_RUNTIME_EDITION: inmem
-            # File handling configuration
-            WORK_DIR: /deps/StoriesExtractor
-            VECTORSTORE_DIR: /deps/StoriesExtractor/vectorstore
-            PPT_REFERENCES_DIR: /deps/StoriesExtractor/vectorstore/ppt_references
-            LOG_DIR: /deps/StoriesExtractor/logs
+            LOG_DIR: /app/logs
             LOG_LEVEL: INFO
-
         volumes:
-            # Mount directories for persistent storage
-            - ./vectorstore:/deps/StoriesExtractor/vectorstore
-            - ./logs:/deps/StoriesExtractor/logs
-    
-    app:
-        depends_on:
-            weaviate:
-                condition: service_healthy
-            # ingestion:
-            #     condition: service_started
-
-        platform: linux/amd64  # keep this for apple chips
-        build:
-            context: .
-            dockerfile: Dockerfile.backend
-        container_name: app
-        env_file:
-            - .env
-        ports:
-            - "8081:8081"
-        volumes:
-            - ./model-cache:/mnt/data/model-cache
+            - ./logs:/app/logs
 
     email-poller:
         build:

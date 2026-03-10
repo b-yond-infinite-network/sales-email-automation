@@ -492,7 +492,7 @@ async def main():
     
     # Wait 5 minutes before starting to ensure all services are ready
     # TODO: change this back to 5 minutes in production, currently set to 5 seconds for testing
-    startup_delay = 5
+    startup_delay = 300
     logging.info(f"Email Poller starting in {startup_delay} seconds...")
     
     try:

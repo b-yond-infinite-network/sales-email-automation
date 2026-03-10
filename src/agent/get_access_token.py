@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 from pathlib import Path
 
+# A standalone script if you need an access token for postman or other testing purposes. 
+
 # Load .env file
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
