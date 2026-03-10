@@ -1,162 +1,136 @@
-# Antoni Test System (Email Classification + Routing)
+# Email Automation — B-Yond Inbox Classifier
 
-This folder is an isolated scaffold copied from the existing project so you can build the new inbound-email automation workflow without modifying the original codebase.
+Polls a Microsoft 365 inbox via the Graph API and automatically classifies inbound form-submission emails using an LLM. Results are logged to an Excel file.
 
-## What was copied
+## How it works
 
-- Core orchestration/runtime files:
-  - `langgraph.json`
-  - `docker-compose.yml`
-  - `Dockerfile.agent`
-  - `Dockerfile.email-poller`
-  - `pyproject.toml`
-  - `poetry.lock`
-  - `.env.example`
-- Agent modules copied into `src/agent/`:
-  - `email_poller.py`
-  - `RAG_graph.py`
-  - `ingestion_graph.py`
-  - `ingest.py`
-  - `graph_schemas.py`
-  - `config.py`
-  - `server.py`
-  - `minio_config.py`
-  - `logger.py`
-  - `auth.py`
-  - `auth_routes.py`
-  - `file_hash_manager.py`
+```
+Microsoft 365 Inbox
+        │
+        ▼
+  email-poller          polls on a configurable interval
+        │
+        ▼
+email-classification-agent   LangGraph graph hosted on langgraph-api
+        │
+        ├── extracts JSON payload from the email body
+        ├── researches the company online
+        └── returns structured classification (qualify/disqualify, company type, countries, etc.)
+        │
+        ▼
+  Excel tracker         appends each result to output/email_classifications.xlsx
+```
 
-## Important current gap
+The poller also triggers the **email-ingestion-agent** graph for emails that contain attachments (PDFs, PowerPoints), which are extracted and passed to the LLM alongside the email body.
 
-`langgraph.json` references:
+## Services
 
-- `./src/agent/email_ingestion_graph.py:email_ingestion_graph`
+| Service | Description |
+|---|---|
+| `email-poller` | Polls the inbox, deduplicates seen emails, calls the classification graph |
+| `langgraph-api` | Hosts the LangGraph graphs (`email-classification-agent`, `email-ingestion-agent`) |
+| `langgraph-postgres` | Persistent state store for LangGraph checkpoints |
+| `langgraph-redis` | In-memory state for LangGraph |
 
-That file does **not** yet exist in this scaffold and should be the first new implementation file for the new workflow.
+## Prerequisites
 
----
+- Docker & Docker Compose
+- A Microsoft 365 account with an **App Registration** in Azure AD (for Graph API access)
+- An [OpenRouter](https://openrouter.ai) API key (or OpenAI-compatible endpoint)
 
-## Target workflow to build
+## Setup
 
-1. **Pull**
-   - `email_poller.py` monitors unread inbox emails via Microsoft Graph.
-2. **Analyze**
-   - Fetch full email body + attachments.
-   - Extract attachment text (PDF/PPTX first).
-3. **Classify**
-   - Use OpenRouter LLM with **structured output** (`Pydantic`) to return:
-     - `interested: bool`
-     - `confidence: float`
-     - `domain: str`
-     - `suggested_recipient: Optional[str]`
-     - `reasoning: str`
-4. **Act**
-   - If interested: forward to selected salesperson.
-   - If not interested (or low confidence): send automatic response.
-   - Mark email as read.
+### 1. Azure App Registration
 
----
+In Azure Active Directory, register an app and grant it the following **application** (not delegated) permissions:
 
-## Next development steps
+- `Mail.Read`
+- `Mail.ReadBasic`
 
-### 1) Create `src/agent/email_ingestion_graph.py`
+Note down the **Client ID**, **Client Secret**, and **Tenant ID**.
 
-Implement LangGraph nodes in this order:
+### 2. Environment variables
 
-- `get_email_messages`
-- `download_attachments`
-- `extract_attachment_text`
-- `retrieve_rag_context`
-- `classify_email`
-- `take_action`
-- `mark_as_read`
+Create a `.env` file in the project root:
 
-Compile graph as `email_ingestion_graph` using `MemorySaver` checkpointer.
+```env
+# Microsoft Graph / MSAL
+CLIENT_ID=
+CLIENT_SECRET=
+TENANT_ID=
+MAIL_USER=inbox@example.com          # mailbox to poll
 
-### 2) Extend state + schemas in `graph_schemas.py`
+# LLM (OpenRouter or OpenAI-compatible)
+OPENROUTER_API_KEY=
+LLM_MODEL=google/gemini-2.5-flash   # or any OpenRouter model
 
-Add models for:
+# LangGraph Postgres
+POSTGRES_PASSWORD=
 
-- `EmailClassificationDecision` (structured LLM output)
-- `EmailIngestionState` additional fields:
-  - `email_content`
-  - `attachments_text`
-  - `retrieved_context`
-  - `interested`
-  - `confidence`
-  - `inquiry_domain`
-  - `suggested_recipient`
-  - `classification_reasoning`
-  - `auto_reply_message`
-  - `action_taken`
+# LangSmith (optional tracing)
+LANGSMITH_API_KEY=
+LANGSMITH_PROJECT=email-automation
+```
 
-### 3) Add routing config in `config.py`
+A full list of supported config keys is in [`src/agent/config.py`](src/agent/config.py).
 
-Add:
+### 3. Run
 
-- `AUTO_FORWARD_IF_INTERESTED`
-- `AUTO_REPLY_IF_NOT_INTERESTED`
-- `DEFAULT_SALES_RECIPIENT`
-- `SALES_ROUTING_JSON` (domain keyword → recipient email)
+```bash
+docker compose up --build
+```
 
-### 4) Update `.env` (or `.env.example`) for new settings
+On first run Docker will build the two images (`Dockerfile.agent` and `Dockerfile.email-poller`).
 
-Add values for the four routing keys above.
+## Configuration
 
-### 5) Reuse RAG retrieval path from `RAG_graph.py`
+Key polling settings in `.env` (or environment):
 
-For `retrieve_rag_context`:
+| Variable | Default | Description |
+|---|---|---|
+| `POLLING_INTERVAL_SECONDS` | `3600` | How often to check the inbox |
+| `MAX_EMAILS_PER_POLL` | `50` | Max emails processed per poll cycle |
+| `LLM_MODEL` | `google/gemini-2.5-flash` | Model used for classification |
+| `USE_RULE_BASED` | `false` | Skip LLM and use rule-based classification |
 
-- Use Weaviate similarity search with current embedding config.
-- Build concise context snippets with source metadata.
-- Pass those snippets into classification prompt.
+## Output
 
-### 6) Implement prompt engineering for classifier node
+Classified emails are appended to `output/email_classifications.xlsx` with columns including:
 
-Use:
+- Thread ID, Email ID, Sender, Subject
+- Action (`qualify` / `disqualify`)
+- Company Name, Company Type, Operation Countries
+- Contact Name, Contact Email, Salesperson
+- Confidence score, Date of Contact
 
-- **System prompt**: B-Yond expertise evaluator + routing assistant behavior.
-- **User prompt**: include email content + attachment text + retrieved context + routing map.
-- OpenAI-compatible parse call with `response_format=EmailClassificationDecision`.
+## Customising the classifier
 
-### 7) Action node with Graph API
+Edit the prompt files in `src/agent/prompts/`:
 
-Implement two Graph calls:
+- `email_classification_system_prompt.txt` — system instructions for the LLM
+- `email_classification_user_prompt.txt` — user message template (supports `{email_subject}`, `{email_body}`, `{attachment_text}`)
 
-- Forward message to salesperson (`/messages/{id}/forward`)
-- Reply to sender (`/messages/{id}/reply`)
+## Utilities
 
-Select action based on classification output + config flags.
+`src/agent/get_access_token.py` is a standalone script for testing Graph API authentication:
 
-### 8) Enable tracing/debugging
+```bash
+python src/agent/get_access_token.py
+```
 
-Use LangSmith env already in `.env`:
+Prints a short preview of the acquired token (or `NO TOKEN` on failure).
 
-- `LANGSMITH_TRACING=true`
-- `LANGSMITH_API_KEY`
-- `LANGSMITH_PROJECT=Antoni Test`
+## Project structure
 
-### 9) Validation checklist
-
-- Import checks for `langgraph`, `openai`, `weaviate`, `msal`.
-- Dry-run a known email ID through graph.
-- Verify action path:
-  - interested → forward + mark read
-  - not interested → reply + mark read
-- Confirm event traces in LangSmith.
-
----
-
-## Suggested implementation order (fastest path)
-
-1. Create `email_ingestion_graph.py` with stub nodes returning mock values.
-2. Wire graph into `langgraph.json` target (same name already configured).
-3. Replace stubs one-by-one with real Graph API + RAG + LLM calls.
-4. Run `docker compose up --build` and test with a single inbox email.
-
----
-
-## Notes
-
-- This scaffold was created to avoid changing the original repository while building the new flow.
-- Existing files in the original path were not modified by this scaffold setup.
+```
+src/agent/
+├── email_poller.py               # Entry point — polls inbox, dispatches to graphs
+├── email_classification_graph.py # LangGraph classification graph
+├── email_ingestion_graph.py      # LangGraph ingestion graph (attachments)
+├── graph_schemas.py              # Pydantic models / LangGraph state
+├── config.py                     # All configuration (pydantic-settings)
+├── excel_tracker.py              # Appends results to Excel
+├── logger.py                     # Centralised logging
+├── get_access_token.py           # Standalone token testing utility
+└── prompts/                      # LLM prompt templates
+```
