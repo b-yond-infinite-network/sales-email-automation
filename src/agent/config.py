@@ -109,6 +109,10 @@ class Config(BaseSettings):
     # Email polling configuration
     POLLING_INTERVAL_SECONDS: int = Field(default=3600)  # 1 hour
     MAX_EMAILS_PER_POLL: int = Field(default=50)  # Limit to prevent overwhelming the system
+    SALESPERSON_EMAIL_MAP_STR: str = Field(
+        default="Victoria:antoni.debicki@b-yond.com,Edu:antoni.debicki@b-yond.com,Casen:antoni.debicki@b-yond.com,Javi:antoni.debicki@b-yond.com,Ziad:antoni.debicki@b-yond.com,none:antoni.debicki@b-yond.com"
+    )
+    _salesperson_email_map: Dict[str, str] = {}
 
     # Graph API Configuration
     GRAPH_API_BASE_URL: str = Field(default="http://langgraph-api:8000")
@@ -126,6 +130,19 @@ class Config(BaseSettings):
     @model_validator(mode='after')
     def validate_config(self):
         """Validate the configuration"""
+        # Parse salesperson email map from string
+        try:
+            salesperson_map = {}
+            if self.SALESPERSON_EMAIL_MAP_STR:
+                for pair in self.SALESPERSON_EMAIL_MAP_STR.split(","):
+                    if ":" in pair:
+                        salesperson, email = pair.split(":", 1)
+                        salesperson_map[salesperson.strip()] = email.strip()
+            self._salesperson_email_map = salesperson_map if salesperson_map else {"none": "antoni.debicki@b-yond.com"}
+        except Exception as exc:
+            logger.warning(f"Failed to parse SALESPERSON_EMAIL_MAP_STR: {exc}")
+            self._salesperson_email_map = {"none": "antoni.debicki@b-yond.com"}
+        
         # Set MSAL authority if not provided
         if not self.MSAL_AUTHORITY and self.TENANT_ID:
             self.MSAL_AUTHORITY = f"https://login.microsoftonline.com/{self.TENANT_ID}"
@@ -143,5 +160,9 @@ class Config(BaseSettings):
             
         return self
     
+    @property
+    def salesperson_email_map(self) -> Dict[str, str]:
+        """Get the parsed salesperson email map."""
+        return self._salesperson_email_map if self._salesperson_email_map else {"none": "antoni.debicki@b-yond.com"}
     
     

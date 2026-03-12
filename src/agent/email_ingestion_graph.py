@@ -610,6 +610,99 @@ async def append_to_excel(state: EmailIngestionState):
         }
 
 
+async def forward_to_salesperson(state: EmailIngestionState):
+    """Forward classified email to assigned salesperson inbox."""
+    try:
+        # Get salesperson from classification
+        classification = state.classification or {}
+        salesperson = classification.get("salesperson", "none")
+        salesperson_email = config.salesperson_email_map.get(salesperson, config.salesperson_email_map.get("none", "antoni.debicki@b-yond.com"))
+        
+        if not state.email_id:
+            logger.warning("No email_id available for forwarding")
+            return {
+                "status": "forward skipped: no email_id",
+            }
+        
+        # Get access token
+        access_token = await get_access_token()
+        if not access_token:
+            logger.error("Failed to get access token for email forwarding")
+            return {
+                "status": "forward failed: no access token",
+            }
+        
+        if not config.MAIL_USER:
+            logger.error("MAIL_USER not configured for email forwarding")
+            return {
+                "status": "forward failed: MAIL_USER not configured",
+            }
+        
+        # Forward the email using Microsoft Graph API
+        forward_url = (
+            f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/messages/{state.email_id}/forward"
+        )
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        
+        # Prepare forward payload with salesperson info in comment
+        forward_payload = {
+            "comment": f"Email forwarded to {salesperson} ({salesperson_email})",
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": salesperson_email
+                    }
+                }
+            ]
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
+                response = await asyncio.wait_for(
+                    async_client.post(
+                        forward_url,
+                        headers=headers,
+                        json=forward_payload
+                    ),
+                    timeout=30.0
+                )
+            
+            if response.status_code == 202:  # 202 Accepted is success for Graph API forward
+                logger.info(
+                    f"Successfully forwarded email {state.email_id} to {salesperson} ({salesperson_email})"
+                )
+                return {
+                    "status": f"email forwarded to {salesperson} ({salesperson_email})",
+                }
+            else:
+                logger.error(
+                    f"Failed to forward email: {response.status_code} {response.text[:500]}"
+                )
+                return {
+                    "status": f"forward failed: HTTP {response.status_code}",
+                }
+        except asyncio.TimeoutError:
+            logger.error("Email forward request timed out after 30s")
+            return {
+                "status": "forward failed: timeout",
+            }
+        except Exception as exc:
+            logger.error(f"Failed to forward email: {type(exc).__name__}: {exc}", exc_info=True)
+            return {
+                "status": f"forward failed: {type(exc).__name__}",
+            }
+    
+    except Exception as exc:
+        logger.error(f"Unexpected error in forward_to_salesperson: {exc}", exc_info=True)
+        return {
+            "status": f"forward failed: unexpected error - {type(exc).__name__}",
+        }
+
+
 email_ingestion_graph_builder = StateGraph(
     EmailIngestionState,
     input_schema=EmailIngestionRequest,
@@ -620,13 +713,13 @@ email_ingestion_graph_builder.add_node("get_email_messages", get_email_messages)
 email_ingestion_graph_builder.add_node("download_attachments", download_attachments)
 email_ingestion_graph_builder.add_node("extract_attachment_text", extract_attachment_text)
 email_ingestion_graph_builder.add_node("classify_email", classify_email)
-email_ingestion_graph_builder.add_node("append_to_excel", append_to_excel)
+email_ingestion_graph_builder.add_node("forward_to_salesperson", forward_to_salesperson)
 
 email_ingestion_graph_builder.add_edge(START, "get_email_messages")
 email_ingestion_graph_builder.add_edge("get_email_messages", "download_attachments")
 email_ingestion_graph_builder.add_edge("download_attachments", "extract_attachment_text")
 email_ingestion_graph_builder.add_edge("extract_attachment_text", "classify_email")
-email_ingestion_graph_builder.add_edge("classify_email", "append_to_excel")
-email_ingestion_graph_builder.add_edge("append_to_excel", END)
+email_ingestion_graph_builder.add_edge("classify_email", "forward_to_salesperson")
+email_ingestion_graph_builder.add_edge("forward_to_salesperson", END)
 
 email_ingestion_graph = email_ingestion_graph_builder.compile()
