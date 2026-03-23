@@ -16,6 +16,7 @@ from src.agent.config import Config
 from src.agent.graph_schemas import EmailClassificationResult, EmailIngestionOutput, EmailIngestionRequest, EmailIngestionState
 from src.agent.logger import get_logger
 from src.agent.excel_tracker import EmailClassificationExcelTracker
+from src.agent.report_generator import generate_report_html
 
 # Timeout constants for API calls
 HTTP_TIMEOUT = httpx.Timeout(30.0)
@@ -610,8 +611,11 @@ async def append_to_excel(state: EmailIngestionState):
         }
 
 
+
+
+
 async def forward_to_salesperson(state: EmailIngestionState):
-    """Forward classified email to assigned salesperson inbox."""
+    """Generate and send a professional qualification report instead of forwarding the email."""
     try:
         # Get salesperson from classification
         classification = state.classification or {}
@@ -619,87 +623,99 @@ async def forward_to_salesperson(state: EmailIngestionState):
         salesperson_email = config.salesperson_email_map.get(salesperson, config.salesperson_email_map.get("none", "antoni.debicki@b-yond.com"))
         
         if not state.email_id:
-            logger.warning("No email_id available for forwarding")
+            logger.warning("No email_id available for report")
             return {
-                "status": "forward skipped: no email_id",
+                "status": "report skipped: no email_id",
             }
         
         # Get access token
         access_token = await get_access_token()
         if not access_token:
-            logger.error("Failed to get access token for email forwarding")
+            logger.error("Failed to get access token for report sending")
             return {
-                "status": "forward failed: no access token",
+                "status": "report failed: no access token",
             }
         
         if not config.MAIL_USER:
-            logger.error("MAIL_USER not configured for email forwarding")
+            logger.error("MAIL_USER not configured for report sending")
             return {
-                "status": "forward failed: MAIL_USER not configured",
+                "status": "report failed: MAIL_USER not configured",
             }
         
-        # Forward the email using Microsoft Graph API
-        forward_url = (
-            f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/messages/{state.email_id}/forward"
-        )
+        # Generate the professional report
+        html_body = generate_report_html(classification, state.sender or "Unknown", state.email_content or "")
+        
+        # Prepare email content
+        company_name = classification.get("company_name", "Company")
+        action = classification.get("action", "processed")
+        contact_name = classification.get("contact_name", "Lead")
+        subject = f"Lead Report: {company_name} - {action.upper()}"
+        
+        # Create the email message
+        send_url = f"https://graph.microsoft.com/v1.0/users/{config.MAIL_USER}/sendMail"
         
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
         
-        # Prepare forward payload with salesperson info in comment
-        forward_payload = {
-            "comment": f"Email forwarded to {salesperson} ({salesperson_email})",
-            "toRecipients": [
-                {
-                    "emailAddress": {
-                        "address": salesperson_email
+        email_payload = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "HTML",
+                    "content": html_body
+                },
+                "toRecipients": [
+                    {
+                        "emailAddress": {
+                            "address": salesperson_email
+                        }
                     }
-                }
-            ]
+                ]
+            }
         }
         
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as async_client:
                 response = await asyncio.wait_for(
                     async_client.post(
-                        forward_url,
+                        send_url,
                         headers=headers,
-                        json=forward_payload
+                        json=email_payload
                     ),
                     timeout=30.0
                 )
             
-            if response.status_code == 202:  # 202 Accepted is success for Graph API forward
+            if response.status_code == 202:  # 202 Accepted is success for Graph API send
                 logger.info(
-                    f"Successfully forwarded email {state.email_id} to {salesperson} ({salesperson_email})"
+                    f"Successfully sent qualification report for {company_name} to {salesperson} ({salesperson_email})"
                 )
                 return {
-                    "status": f"email forwarded to {salesperson} ({salesperson_email})",
+                    "status": f"report sent to {salesperson} ({salesperson_email})",
                 }
             else:
                 logger.error(
-                    f"Failed to forward email: {response.status_code} {response.text[:500]}"
+                    f"Failed to send report: {response.status_code} {response.text[:500]}"
                 )
                 return {
-                    "status": f"forward failed: HTTP {response.status_code}",
+                    "status": f"report failed: HTTP {response.status_code}",
                 }
         except asyncio.TimeoutError:
-            logger.error("Email forward request timed out after 30s")
+            logger.error("Report send request timed out after 30s")
             return {
-                "status": "forward failed: timeout",
+                "status": "report failed: timeout",
             }
         except Exception as exc:
-            logger.error(f"Failed to forward email: {type(exc).__name__}: {exc}", exc_info=True)
+            logger.error(f"Failed to send report: {type(exc).__name__}: {exc}", exc_info=True)
             return {
-                "status": f"forward failed: {type(exc).__name__}",
+                "status": f"report failed: {type(exc).__name__}",
             }
     
     except Exception as exc:
         logger.error(f"Unexpected error in forward_to_salesperson: {exc}", exc_info=True)
         return {
-            "status": f"forward failed: unexpected error - {type(exc).__name__}",
+            "status": f"report failed: unexpected error - {type(exc).__name__}",
         }
 
 
