@@ -1,4 +1,6 @@
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Optional
 
 from openai import AsyncOpenAI
@@ -27,14 +29,54 @@ COMMON_PERSONAL_DOMAINS = {
     "protonmail.com",
 }
 
+EMAIL_PROVIDER_BLACKLIST_PATH = Path(__file__).parent / "assets" / "all_email_provider_domains.txt"
+
 
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def _normalize_domain(domain: Optional[str]) -> str:
+    raw = (domain or "").strip().lower()
+    if not raw:
+        return ""
+
+    if "@" in raw:
+        raw = raw.split("@")[-1]
+    if raw.startswith("www."):
+        raw = raw[4:]
+    return raw.strip(". ")
+
+
+@lru_cache(maxsize=1)
+def load_personal_email_blacklist() -> set[str]:
+    domains = {d.lower() for d in COMMON_PERSONAL_DOMAINS}
+
+    try:
+        for line in EMAIL_PROVIDER_BLACKLIST_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+            candidate = _normalize_domain(line)
+            if not candidate:
+                continue
+            if candidate.startswith("#") or candidate.startswith("/*"):
+                continue
+            if re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", candidate):
+                domains.add(candidate)
+    except Exception as exc:
+        logger.warning("Failed to load email provider blacklist from %s: %s", EMAIL_PROVIDER_BLACKLIST_PATH, exc)
+
+    return domains
+
+
+def is_blacklisted_email_domain(domain: Optional[str]) -> bool:
+    normalized = _normalize_domain(domain)
+    if not normalized:
+        return False
+    return normalized in load_personal_email_blacklist()
 
 
 def _extract_email_domain(email: Optional[str]) -> str:
     if not email or "@" not in email:
         return ""
-    return email.split("@")[-1].strip().lower()
+    return _normalize_domain(email)
 
 
 def _extract_form_email(email_subject: str, email_body: str) -> str:
@@ -121,14 +163,14 @@ async def run_company_verification(
             "status": "company verification skipped: missing form email domain",
         }
 
-    if form_domain in COMMON_PERSONAL_DOMAINS:
+    if is_blacklisted_email_domain(form_domain):
         fallback = CompanyVerificationResult(
             is_corporate_email=False,
             is_legit_company=False,
             company_type="unknown",
             company_name=company_name or None,
             sender_domain=form_domain,
-            reason="form email domain is a known personal email provider",
+            reason="form email domain is in personal/provider blacklist",
         )
         return {
             "company_verification": fallback.model_dump(),

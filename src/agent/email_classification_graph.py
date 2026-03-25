@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
 from src.agent.config import Config
+from src.agent.company_verification_layer import is_blacklisted_email_domain
 from src.agent.graph_schemas import (
     EmailClassificationOutput,
     EmailClassificationRequest,
@@ -341,6 +342,31 @@ async def classify_email(state: EmailClassificationState):
         }
 
 
+async def enforce_personal_email_blacklist(state: EmailClassificationState):
+    classification = dict(state.classification or {})
+    contact_email = str(classification.get("email") or "").strip().lower()
+    email_domain = contact_email.split("@")[-1] if "@" in contact_email else ""
+
+    if not email_domain:
+        return {
+            "status": "email blacklist check skipped: missing contact email domain",
+        }
+
+    if not is_blacklisted_email_domain(email_domain):
+        return {
+            "status": "email blacklist check passed",
+        }
+
+    classification["action"] = "disqualify"
+    classification["salesperson"] = "none"
+    classification["blacklist_reason"] = f"personal/provider email domain blocked: {email_domain}"
+
+    return {
+        "classification": classification,
+        "status": "email disqualified by personal/provider blacklist",
+    }
+
+
 email_classification_graph_builder = StateGraph(
     EmailClassificationState,
     input_schema=EmailClassificationRequest,
@@ -350,10 +376,12 @@ email_classification_graph_builder = StateGraph(
 email_classification_graph_builder.add_node("build_query_text", build_query_text)
 email_classification_graph_builder.add_node("retrieve_context", retrieve_context)
 email_classification_graph_builder.add_node("classify_email", classify_email)
+email_classification_graph_builder.add_node("enforce_personal_email_blacklist", enforce_personal_email_blacklist)
 
 email_classification_graph_builder.add_edge(START, "build_query_text")
 email_classification_graph_builder.add_edge("build_query_text", "retrieve_context")
 email_classification_graph_builder.add_edge("retrieve_context", "classify_email")
-email_classification_graph_builder.add_edge("classify_email", END)
+email_classification_graph_builder.add_edge("classify_email", "enforce_personal_email_blacklist")
+email_classification_graph_builder.add_edge("enforce_personal_email_blacklist", END)
 
 email_classification_graph = email_classification_graph_builder.compile()

@@ -13,6 +13,7 @@ from pptx import Presentation
 from langgraph.graph import END, START, StateGraph
 
 from src.agent.config import Config
+from src.agent.company_verification_layer import is_blacklisted_email_domain
 from src.agent.graph_schemas import EmailClassificationResult, EmailIngestionOutput, EmailIngestionRequest, EmailIngestionState
 from src.agent.logger import get_logger
 from src.agent.excel_tracker import EmailClassificationExcelTracker
@@ -537,6 +538,31 @@ async def classify_email(state: EmailIngestionState):
         }
 
 
+async def enforce_personal_email_blacklist(state: EmailIngestionState):
+    classification = dict(state.classification or {})
+    contact_email = str(classification.get("email") or "").strip().lower()
+    email_domain = contact_email.split("@")[-1] if "@" in contact_email else ""
+
+    if not email_domain:
+        return {
+            "status": "email blacklist check skipped: missing contact email domain",
+        }
+
+    if not is_blacklisted_email_domain(email_domain):
+        return {
+            "status": "email blacklist check passed",
+        }
+
+    classification["action"] = "disqualify"
+    classification["salesperson"] = "none"
+    classification["blacklist_reason"] = f"personal/provider email domain blocked: {email_domain}"
+
+    return {
+        "classification": classification,
+        "status": "email disqualified by personal/provider blacklist",
+    }
+
+
 def _append_to_excel_sync(
     thread_id: str,
     created_at: str,
@@ -729,13 +755,15 @@ email_ingestion_graph_builder.add_node("get_email_messages", get_email_messages)
 email_ingestion_graph_builder.add_node("download_attachments", download_attachments)
 email_ingestion_graph_builder.add_node("extract_attachment_text", extract_attachment_text)
 email_ingestion_graph_builder.add_node("classify_email", classify_email)
+email_ingestion_graph_builder.add_node("enforce_personal_email_blacklist", enforce_personal_email_blacklist)
 email_ingestion_graph_builder.add_node("forward_to_salesperson", forward_to_salesperson)
 
 email_ingestion_graph_builder.add_edge(START, "get_email_messages")
 email_ingestion_graph_builder.add_edge("get_email_messages", "download_attachments")
 email_ingestion_graph_builder.add_edge("download_attachments", "extract_attachment_text")
 email_ingestion_graph_builder.add_edge("extract_attachment_text", "classify_email")
-email_ingestion_graph_builder.add_edge("classify_email", "forward_to_salesperson")
+email_ingestion_graph_builder.add_edge("classify_email", "enforce_personal_email_blacklist")
+email_ingestion_graph_builder.add_edge("enforce_personal_email_blacklist", "forward_to_salesperson")
 email_ingestion_graph_builder.add_edge("forward_to_salesperson", END)
 
 email_ingestion_graph = email_ingestion_graph_builder.compile()
